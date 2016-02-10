@@ -1,48 +1,32 @@
-import os
-import sys
-import time
+#!/usr/bin/env python
+
+# Import standard python libs
+import sys, os, time
 from datetime import datetime
-import daemon
+try:
+    from urllib.request import urlopen
+except ImportError:
+    from urllib2 import urlopen
 import signal
 import threading
-import twitter
-import json 
+import json
 import random
+import logging
+
+# Import third-party libs
 from logger import Logger
-
-shutdownFlag = False
-
-def main(filename, argv):
-    print "======================================"
-    print " Starting Speed Complainer!           "
-    print " Lets get noisy!                      "
-    print "======================================"
-
-    global shutdownFlag
-    signal.signal(signal.SIGINT, shutdownHandler)
-
-    monitor = Monitor()
-
-    while not shutdownFlag:
-        try:
-
-            monitor.run()
-
-            for i in range(0, 5):
-                if shutdownFlag:
-                    break
-                time.sleep(1)
-
-        except Exception as e:
-            print 'Error: %s' % e
-            sys.exit(1)
-
-    sys.exit()
-
-def shutdownHandler(signo, stack_frame):
-    global shutdownFlag
-    print 'Got shutdown signal (%s: %s).' % (signo, stack_frame)
-    shutdownFlag = True
+try:
+    from daemon import runner
+    HAS_DAEMON=True
+except ImportError as e:
+    sys.stderr.write('Import Error: {0}\n'.format(e))
+    sys.exit(2)
+try:
+    import twitter
+    HAS_TWITTER=True
+except ImportError as e:
+    log.info('Twitter API library not found, will not publish tweets.\n')
+    HAS_TWITTER=False
 
 class Monitor():
     def __init__(self):
@@ -80,6 +64,7 @@ class PingTest(threading.Thread):
         self.logPingResults(pingResults)
 
     def doPingTest(self):
+        log.debug('Performing PingTest')
         response = os.system("ping -c %s -W %s -w %s 8.8.8.8 > /dev/null 2>&1" % (self.numPings, (self.pingTimeout * 1000), self.maxWaitTime))
         success = 0
         if response == 0:
@@ -87,6 +72,7 @@ class PingTest(threading.Thread):
         return { 'date': datetime.now(), 'success': success }
 
     def logPingResults(self, pingResults):
+        log.debug('Logging Ping Results')
         self.logger.log([ pingResults['date'].strftime('%Y-%m-%d %H:%M:%S'), str(pingResults['success'])])
 
 class SpeedTest(threading.Thread):
@@ -98,75 +84,108 @@ class SpeedTest(threading.Thread):
     def run(self):
         speedTestResults = self.doSpeedTest()
         self.logSpeedTestResults(speedTestResults)
-        self.tweetResults(speedTestResults)
+        if HAS_TWITTER and 'twitter' in self.config:
+            log.debug('Have Twitter and sending results')
+            self.tweetResults(speedTestResults)
 
     def doSpeedTest(self):
         # run a speed test
-        result = os.popen("/usr/local/bin/speedtest-cli --simple").read()
+        log.info('Performing SpeedTest')
+        result = os.popen("speedtest-cli --simple --share").read()
         if 'Cannot' in result:
-            return { 'date': datetime.now(), 'uploadResult': 0, 'downloadResult': 0, 'ping': 0 }
+            log.info('Speedtest failed to return results')
+            return { 'date': datetime.now(), 'uploadResult': 0, 'downloadResult': 0, 'ping': 0, 'imageResult': None }
 
         # Result:
         # Ping: 529.084 ms
         # Download: 0.52 Mbit/s
         # Upload: 1.79 Mbit/s
+        # Share results: http://www.speedtest.net/result/1234567890.png
 
-        resultSet = result.split('\n')
+        resultSet = result.splitlines()
         pingResult = resultSet[0]
         downloadResult = resultSet[1]
         uploadResult = resultSet[2]
+        imageResult = resultSet[3]
 
         pingResult = float(pingResult.replace('Ping: ', '').replace(' ms', ''))
         downloadResult = float(downloadResult.replace('Download: ', '').replace(' Mbit/s', ''))
         uploadResult = float(uploadResult.replace('Upload: ', '').replace(' Mbit/s', ''))
-
-        return { 'date': datetime.now(), 'uploadResult': uploadResult, 'downloadResult': downloadResult, 'ping': pingResult }
+        imageResult = str(imageResult.replace('Share results: ', ''))
+        return { 'date': datetime.now(), 'uploadResult': uploadResult, 'downloadResult': downloadResult, 'ping': pingResult, 'imageResult': imageResult }
 
     def logSpeedTestResults(self, speedTestResults):
-        self.logger.log([ speedTestResults['date'].strftime('%Y-%m-%d %H:%M:%S'), str(speedTestResults['uploadResult']), str(speedTestResults['downloadResult']), str(speedTestResults['ping']) ])
+        log.debug('Logging SpeedTest results')
+        self.logger.log([ speedTestResults['date'].strftime('%Y-%m-%d %H:%M:%S'), str(speedTestResults['uploadResult']), str(speedTestResults['downloadResult']), str(speedTestResults['ping']), str(speedTestResults['imageResult']) ])
 
 
     def tweetResults(self, speedTestResults):
+        log.debug('Preparing to tweet results')
         thresholdMessages = self.config['tweetThresholds']
         message = None
+        media = None
+        api = twitter.Api(consumer_key=self.config['twitter']['twitterConsumerKey'],
+                        consumer_secret=self.config['twitter']['twitterConsumerSecret'],
+                        access_token_key=self.config['twitter']['twitterToken'],
+                        access_token_secret=self.config['twitter']['twitterTokenSecret'])
         for (threshold, messages) in thresholdMessages.items():
             threshold = float(threshold)
             if speedTestResults['downloadResult'] < threshold:
                 message = messages[random.randint(0, len(messages) - 1)].replace('{tweetTo}', self.config['tweetTo']).replace('{internetSpeed}', self.config['internetSpeed']).replace('{downloadResult}', str(speedTestResults['downloadResult']))
 
-        if message:
-            api = twitter.Api(consumer_key=self.config['twitter']['twitterConsumerKey'],
-                            consumer_secret=self.config['twitter']['twitterConsumerSecret'],
-                            access_token_key=self.config['twitter']['twitterToken'],
-                            access_token_secret=self.config['twitter']['twitterTokenSecret'])
-            if api:
-                status = api.PostUpdate(message)
+        if speedTestResults['imageResult']:
+            media = urlopen(str(speedTestResults['imageResult']))
 
-class DaemonApp():
-    def __init__(self, pidFilePath, stdout_path='/dev/null', stderr_path='/dev/null'):
-        self.stdin_path = '/dev/null'
-        self.stdout_path = stdout_path
-        self.stderr_path = stderr_path
-        self.pidfile_path = pidFilePath
-        self.pidfile_timeout = 1
+        if media and message and api:
+            status = api.PostMedia(message, media)
+
+        elif message and api:
+            status = api.PostUpdate(message)
+
+        if status:
+            log.info('Tweet {0} posted'.format(status.id_str))
+
+class SpeedComplainer():
+    def __init__(self, stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+        self.stdin_path = stdin
+        self.stdout_path = stdout
+        self.stderr_path = stderr
+        self.pidfile_timeout = 5
 
     def run(self):
-        main(__file__, sys.argv[1:])
+        monitor = Monitor()
+        while True:
+            try:
+                monitor.run()
+                for i in range(0, 5):
+                    time.sleep(1)
+            except Exception as e:
+                print ('Error: {0}'.format(e))
+                sys.exit(1)
 
 if __name__ == '__main__':
-    main(__file__, sys.argv[1:])
+    workingDirectory = os.path.dirname(os.path.abspath(__file__))
+    fileName, fileExt = os.path.splitext(os.path.basename(__file__))
+    pidFilePath = os.path.join(workingDirectory, '{0}.pid'.format(fileName))
+    logFilePath = os.path.join(workingDirectory, '{0}.log'.format(fileName))
 
-    workingDirectory = os.path.basename(os.path.realpath(__file__))
-    stdout_path = '/dev/null'
-    stderr_path = '/dev/null'
-    fileName, fileExt = os.path.split(os.path.realpath(__file__))
-    pidFilePath = os.path.join(workingDirectory, os.path.basename(fileName) + '.pid')
-    from daemon import runner
-    dRunner = runner.DaemonRunner(DaemonApp(pidFilePath, stdout_path, stderr_path))
-    dRunner.daemon_context.working_directory = workingDirectory
-    dRunner.daemon_context.umask = 0o002
-    dRunner.daemon_context.signal_map = { signal.SIGTERM: 'terminate', signal.SIGUP: 'terminate' }
-    dRunner.do_action()
+    app = SpeedComplainer()
+    app.pidfile_path = pidFilePath
 
+    log = logging.getLogger("DaemonLog")
+    log.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    handler = logging.FileHandler(logFilePath)
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
 
-
+    daemon = runner.DaemonRunner(app)
+    daemon.daemon_context.working_directory = workingDirectory
+    daemon.daemon_context.files_preserve=[handler.stream]
+    daemon.daemon_context.umask = 077
+    if len(sys.argv) == 2 and 'stop' != sys.argv[1]:
+        log.info("======================================")
+        log.info("Starting Speed Complainer!")
+        log.info("Let's get noisy!")
+        log.info("======================================")
+    daemon.do_action()
