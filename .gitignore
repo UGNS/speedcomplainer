@@ -1,1 +1,12 @@
 .idea
+# Python byte-compiled files
+*.pyc
+# CSV log files
+*.csv
+# python-daemon pidfile
+*.pid
+# Python virtualenv directories
+bin/
+include/
+lib/
+local/
